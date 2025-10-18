@@ -7,17 +7,18 @@
   <style>
     :root { --ok:#2ecc71; --bad:#e74c3c; --fg:#222; --muted:#666; }
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:#f7f7f8; color:var(--fg); margin:0; }
-    .wrap { max-width: 720px; margin: 24px auto; padding: 0 16px; }
-    h1 { font-size: 1.3rem; margin: 0 0 8px; }
+    .wrap { max-width: 760px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.2rem; margin: 0 0 8px; }
     .card { background:#fff; border-radius:12px; box-shadow: 0 6px 18px rgba(0,0,0,.06); padding:16px; margin: 12px 0; }
     .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
     .pill { padding:6px 10px; border-radius:999px; font-size:.9rem; }
-    .ok { background: #eafaf0; color: #1e874b; }
-    .bad { background: #fdecea; color: #a33a2a; }
-    .muted { color: var(--muted); }
-    video { width:100%; max-width: 420px; border-radius: 12px; box-shadow: 0 0 8px rgba(0,0,0,.15); background:#000; }
+    .ok { background:#eafaf0; color:#1e874b; }
+    .bad { background:#fdecea; color:#a33a2a; }
+    .muted { color:var(--muted); }
+    video { width:100%; max-width: 440px; border-radius: 12px; box-shadow: 0 0 8px rgba(0,0,0,.15); background:#000; }
     label { font-weight:600; }
-    input[type="range"] { width: 220px; }
+    input[type="range"], select { padding:6px 8px; border-radius:8px; border:1px solid #ddd; }
+    button { padding:8px 12px; border:0; border-radius:10px; background:#222; color:#fff; cursor:pointer; }
     code { background:#f0f0f0; padding:2px 6px; border-radius:6px; }
     .small { font-size:.9rem; }
   </style>
@@ -29,118 +30,154 @@
     <div class="card">
       <div class="row">
         <div id="mqtt-pill" class="pill bad">MQTT: desconectado</div>
-        <div id="cam-pill" class="pill bad">Cámara: sin permiso</div>
-        <div class="pill bad" id="model-pill">Modelo: cargando…</div>
+        <div id="cam-pill" class="pill bad">Cámara: sin iniciar</div>
+        <div id="model-pill" class="pill bad">Modelo: cargando…</div>
       </div>
       <div class="small muted" id="status">Iniciando…</div>
       <div class="small" id="err" style="margin-top:6px;color:#a33a2a;"></div>
     </div>
 
     <div class="card">
-      <div class="row" style="justify-content:space-between;">
+      <div class="row">
+        <button id="btnStart">🎥 Iniciar cámara</button>
+        <label for="cameraSelect">Cámara:</label>
+        <select id="cameraSelect"></select>
+        <button id="btnRefresh">🔄 Actualizar lista</button>
+      </div>
+      <div class="small muted">
+        Si aparece “Requested device not found”, permite la cámara para <code>github.io</code>,
+        cierra apps que la usen o elige otra cámara en la lista.
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; align-items:flex-end;">
         <div>
-          <div><label>Umbral (confianza): </label>
-            <span id="thVal">0.80</span>
-          </div>
+          <label>Umbral (confianza):</label>
+          <span id="thVal">0.80</span>
           <input id="thSlider" type="range" min="0.50" max="0.98" step="0.01" value="0.80" />
+          <div class="small muted">Publica solo al cruzar el umbral (rising edge).</div>
         </div>
         <div>
-          <label>Tópico MQTT:</label>
+          <label>Tópico MQTT (debe coincidir en la ESP32):</label>
           <div class="small"><code id="topicLabel">umng/tm/esp32/84aQnaddKh</code></div>
+          <div class="small">Broker: <code id="brokerLabel"></code></div>
+          <div class="small muted">Fuerza broker con <code>#emqx</code> o <code>#mosquitto</code> en la URL.</div>
         </div>
       </div>
-      <div class="small muted">Broker actual: <code id="brokerLabel"></code></div>
-      <div class="small muted">Tips: si no conecta, prueba datos móviles / otra Wi-Fi, o abre con <code>#emqx</code> al final de la URL.</div>
+      <div style="margin-top:12px">
+        <button id="btnTest">📤 Enviar PRUEBA (carrito 0.99)</button>
+        <span class="small muted">— útil para verificar que la ESP32 reciba.</span>
+      </div>
     </div>
 
     <div class="card" style="text-align:center;">
       <video id="webcam" autoplay playsinline muted></video>
-      <div id="pred" style="margin-top:8px;font-size:1.1rem;">carrito: —</div>
+      <div id="pred" style="margin-top:8px;font-size:1.05rem;">carrito: —</div>
     </div>
 
     <div class="card small">
       <b>Registro:</b>
-      <div id="log" style="max-height:160px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;"></div>
+      <div id="log" style="max-height:180px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;"></div>
     </div>
   </div>
 
   <!-- TF.js + Teachable Machine -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
-  <!-- MQTT over WebSockets -->
+  <!-- MQTT over WSS -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
   <script>
-    // =============== CONFIG ===============
+    // ============ CONFIG ============
     const MODEL_URL    = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/";
-    const MQTT_TOPIC   = "umng/tm/esp32/84aQnaddKh"; // mismo en tu ESP32
+    const MQTT_TOPIC   = "umng/tm/esp32/84aQnaddKh";     // idem en tu ESP32
     const TARGET_LABEL = "carrito";
-    const LOOP_LIMIT_MS = 240;
+    const LOOP_MS = 240;
     const PUBLISH_COOLDOWN_MS = 600;
 
-    // Lista de brokers WSS (fallback). Cambia orden si quieres priorizar EMQX:
+    // Brokers WSS (fallback). Cambia orden si quieres priorizar EMQX.
     const BROKERS = [
       { name:"mosquitto", url:"wss://test.mosquitto.org:8081/mqtt" },
       { name:"emqx",      url:"wss://broker.emqx.io:8084/mqtt" }
     ];
-
-    // Permite elegir broker con #mosquitto o #emqx en la URL
     const hash = (location.hash || "").replace("#","").toLowerCase().trim();
-    let brokerIndex = Math.max(0, BROKERS.findIndex(b=>b.name===hash));
-    if (hash && brokerIndex === -1) brokerIndex = 0; // si hash no coincide, arranca normal
+    let brokerIndex = BROKERS.findIndex(b=>b.name===hash);
+    if (brokerIndex < 0) brokerIndex = 0;
 
-    // =============== STATE/UI ===============
-    let model, client, webcamEl;
-    let lastLoop = 0, lastPublished = 0;
-    let lastOverThreshold = false;
-    let threshold = 0.80;
+    // ============ STATE/UI ============
+    let model, client, stream, webcamEl = document.getElementById("webcam");
+    let threshold = 0.80, lastLoop=0, lastPublished=0, lastOver=false;
+
     const $ = (id)=>document.getElementById(id);
-    const log = (t)=>{ const L = $("log"); const line = document.createElement("div"); line.textContent = t; L.prepend(line); }
-    const setPill = (id, ok, text)=>{ const el=$(id); el.classList.remove("ok","bad"); el.classList.add(ok?"ok":"bad"); el.textContent = text; }
+    const log = (t)=>{ const L=$("log"); const d=document.createElement("div"); d.textContent=t; L.prepend(d); };
+    const setPill=(id,ok,txt)=>{ const el=$(id); el.classList.remove("ok","bad"); el.classList.add(ok?"ok":"bad"); el.textContent=txt; };
 
     $("topicLabel").textContent = MQTT_TOPIC;
-    $("thSlider").addEventListener("input", e=>{
-      threshold = Number(e.target.value);
-      $("thVal").textContent = threshold.toFixed(2);
-    });
+    $("thSlider").addEventListener("input", e=>{ threshold=+e.target.value; $("thVal").textContent=threshold.toFixed(2); });
 
     function currentBroker(){ return BROKERS[brokerIndex]; }
     function showBroker(){ $("brokerLabel").textContent = `${currentBroker().name} → ${currentBroker().url}`; }
 
-    // =============== INIT ===============
-    async function init() {
+    // ============ Enumerar cámaras ============
+    async function listCameras() {
       try {
-        showBroker();
-
-        // 1) Modelo
-        setPill("model-pill", false, "Modelo: cargando…");
-        model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
-        setPill("model-pill", true, "Modelo: listo");
-
-        // 2) Cámara
-        webcamEl = $("webcam");
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } }, audio: false
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        const vids = devs.filter(d=>d.kind==="videoinput");
+        const sel = $("cameraSelect");
+        sel.innerHTML = "";
+        vids.forEach((d,i)=>{
+          const opt = document.createElement("option");
+          opt.value = d.deviceId;
+          opt.textContent = d.label || `Cámara ${i+1}`;
+          sel.appendChild(opt);
         });
-        webcamEl.srcObject = stream;
-        await webcamEl.play();
-        setPill("cam-pill", true, "Cámara: OK");
-        $("status").textContent = "Cámara y modelo listos.";
-
-        // 3) MQTT
-        connectMqtt();
-      } catch (err) {
-        $("status").textContent = "Error: " + err.message;
-        setPill("cam-pill", false, "Cámara/Modelo: error");
-        $("err").textContent = err.stack || err.message || String(err);
-        log("Init error: " + (err.stack || err.message || err));
+        if (!vids.length) throw new Error("No se encontraron cámaras en este dispositivo.");
+        log(`Cámaras: ${vids.map(v=>v.label||v.deviceId).join(" | ")}`);
+      } catch (e) {
+        $("err").textContent = e.message;
+        log("enumerateDevices error: " + e.message);
       }
     }
 
+    // ============ Iniciar cámara ============
+    async function startCamera() {
+      try {
+        if (stream) { stream.getTracks().forEach(t=>t.stop()); stream=null; }
+
+        if (!$("cameraSelect").options.length) {
+          try {
+            const tmp = await navigator.mediaDevices.getUserMedia({ video:true, audio:false });
+            tmp.getTracks().forEach(t=>t.stop());
+          } catch(_) {}
+          await listCameras();
+        }
+
+        const deviceId = $("cameraSelect").value;
+        const constraints = deviceId
+          ? { video:{ deviceId:{ exact: deviceId } }, audio:false }
+          : { video:{ facingMode:{ ideal:"environment" } }, audio:false };
+
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        webcamEl.srcObject = stream;
+        await webcamEl.play();
+
+        setPill("cam-pill", true, "Cámara: OK");
+        $("status").textContent = "Cámara lista.";
+        log("Cámara iniciada.");
+      } catch (e) {
+        setPill("cam-pill", false, "Cámara: error");
+        $("err").textContent = e.message || String(e);
+        log("startCamera error: " + (e.message || e));
+      }
+    }
+
+    // ============ MQTT ============
     function connectMqtt() {
       const broker = currentBroker();
       setPill("mqtt-pill", false, "MQTT: conectando…");
       $("err").textContent = "";
+      showBroker();
       log(`Conectando a ${broker.name}… (${broker.url})`);
 
       client = mqtt.connect(broker.url, {
@@ -148,7 +185,7 @@
         clean: true,
         connectTimeout: 6000,
         keepalive: 30,
-        reconnectPeriod: 0, // manejamos reintento manual para cambiar de broker
+        reconnectPeriod: 0
       });
 
       client.on("connect", ()=>{
@@ -156,63 +193,90 @@
         log("MQTT conectado → " + broker.url);
         requestAnimationFrame(loop);
       });
-
       client.on("close", ()=>{
         setPill("mqtt-pill", false, "MQTT: desconectado");
         log("MQTT cerrado");
       });
-
       client.on("error", (e)=>{
         setPill("mqtt-pill", false, "MQTT: error");
         const msg = (e && (e.message || e.toString())) || "error desconocido";
         $("err").textContent = `Error MQTT (${broker.name}): ${msg}`;
         log(`MQTT error (${broker.name}): ${msg}`);
-
-        // Intentar siguiente broker tras un pequeño delay
+        // probar siguiente broker
         setTimeout(()=>{
-          tryNextBroker();
+          try { client && client.end(true); } catch(_){}
+          brokerIndex = (brokerIndex + 1) % BROKERS.length;
+          connectMqtt();
         }, 800);
       });
     }
 
-    function tryNextBroker(){
-      // Cierra si quedó colgado
-      try { client && client.end(true); } catch(e){}
-      brokerIndex = (brokerIndex + 1) % BROKERS.length;
-      showBroker();
-      connectMqtt();
+    // ============ Modelo TM ============
+    async function loadModel() {
+      try {
+        setPill("model-pill", false, "Modelo: cargando…");
+        model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+        setPill("model-pill", true, "Modelo: listo");
+        $("status").textContent = "Modelo cargado. Inicia la cámara y se enviará MQTT al superar el umbral.";
+      } catch (e) {
+        setPill("model-pill", false, "Modelo: error");
+        $("err").textContent = e.message;
+        log("Modelo error: " + e.message);
+      }
     }
 
-    // =============== LOOP ===============
-    async function loop(ts) {
-      try {
-        if (!lastLoop || (ts - lastLoop) >= LOOP_LIMIT_MS) {
-          lastLoop = ts;
-
-          // Predicción
+    // ============ Bucle de inferencia ============
+    async function loop(ts){
+      if (!model || !stream) { requestAnimationFrame(loop); return; }
+      if (!lastLoop || (ts - lastLoop) >= LOOP_MS) {
+        lastLoop = ts;
+        try {
           const preds = await model.predict(webcamEl);
-          const target = preds.find(p => (p.className || "").toLowerCase().trim() === TARGET_LABEL);
-          const prob = target ? Number(target.probability) : 0;
+          const tgt = preds.find(p => (p.className||"").toLowerCase().trim() === TARGET_LABEL);
+          const prob = tgt ? Number(tgt.probability) : 0;
           $("pred").textContent = `carrito: ${(prob*100).toFixed(1)}%`;
 
-          // Publicar solo cuando cruza el umbral (rising edge)
           const over = prob >= threshold;
           const now = performance.now();
-          if (client && client.connected && over && !lastOverThreshold && (now - lastPublished) > PUBLISH_COOLDOWN_MS) {
-            const payload = JSON.stringify({ label: TARGET_LABEL, score: Number(prob.toFixed(3)), ts: Date.now() });
-            client.publish(MQTT_TOPIC, payload, { qos: 0, retain: false });
+          if (client && client.connected && over && !lastOver && (now - lastPublished) > PUBLISH_COOLDOWN_MS) {
+            const payload = JSON.stringify({ label:"carrito", score: Number(prob.toFixed(3)), ts: Date.now() });
+            client.publish(MQTT_TOPIC, payload, { qos:0, retain:false });
             lastPublished = now;
             log("Publicado: " + payload);
           }
-          lastOverThreshold = over;
+          lastOver = over;
+        } catch (e) {
+          $("err").textContent = e.message;
+          log("Loop error: " + e.message);
         }
-      } catch (err) {
-        log("Loop error: " + (err.message || err));
       }
       requestAnimationFrame(loop);
     }
 
-    init();
+    // ============ Arranque ============
+    (async ()=>{
+      if (!("mediaDevices" in navigator)) {
+        $("err").textContent = "Este navegador no soporta cámara (mediaDevices).";
+        return;
+      }
+      await loadModel();
+      await listCameras();
+      connectMqtt();
+
+      $("btnStart").addEventListener("click", startCamera);
+      $("btnRefresh").addEventListener("click", listCameras);
+      $("btnTest").addEventListener("click", ()=>{
+        if (client && client.connected) {
+          const payload = JSON.stringify({ label:"carrito", score:0.99, ts: Date.now() });
+          client.publish(MQTT_TOPIC, payload, { qos:0, retain:false });
+          log("Publicado TEST: " + payload);
+        } else {
+          log("MQTT no conectado");
+        }
+      });
+
+      $("status").textContent = "Pulsa “Iniciar cámara”, elige dispositivo si hace falta. Si tu ESP32 usa EMQX, abre esta página con #emqx.";
+    })();
   </script>
 </body>
 </html>
