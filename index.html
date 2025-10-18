@@ -30,9 +30,10 @@
       <div class="row">
         <div id="mqtt-pill" class="pill bad">MQTT: desconectado</div>
         <div id="cam-pill" class="pill bad">Cámara: sin permiso</div>
-        <div class="pill ok" id="model-pill">Modelo: cargando…</div>
+        <div class="pill bad" id="model-pill">Modelo: cargando…</div>
       </div>
       <div class="small muted" id="status">Iniciando…</div>
+      <div class="small" id="err" style="margin-top:6px;color:#a33a2a;"></div>
     </div>
 
     <div class="card">
@@ -48,6 +49,8 @@
           <div class="small"><code id="topicLabel">umng/tm/esp32/84aQnaddKh</code></div>
         </div>
       </div>
+      <div class="small muted">Broker actual: <code id="brokerLabel"></code></div>
+      <div class="small muted">Tips: si no conecta, prueba datos móviles / otra Wi-Fi, o abre con <code>#emqx</code> al final de la URL.</div>
     </div>
 
     <div class="card" style="text-align:center;">
@@ -68,21 +71,29 @@
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
   <script>
-    // ===================== CONFIG =====================
-    const MODEL_URL    = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/"; // tu modelo TM
-    const MQTT_WSS_URL = "wss://test.mosquitto.org:8081/mqtt"; // broker Mosquitto público (WSS para navegador)
-    const MQTT_TOPIC   = "umng/tm/esp32/84aQnaddKh";           // usa el mismo en tu ESP32
-    const TARGET_LABEL = "carrito";                            // clase objetivo en minúsculas
-    const LOOP_LIMIT_MS = 240;      // cadencia de predicción (~4 fps para móviles modestos)
-    const PUBLISH_COOLDOWN_MS = 600; // mínimo entre publicaciones válidas (evita spam)
+    // =============== CONFIG ===============
+    const MODEL_URL    = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/";
+    const MQTT_TOPIC   = "umng/tm/esp32/84aQnaddKh"; // mismo en tu ESP32
+    const TARGET_LABEL = "carrito";
+    const LOOP_LIMIT_MS = 240;
+    const PUBLISH_COOLDOWN_MS = 600;
 
-    // ===================== STATE ======================
+    // Lista de brokers WSS (fallback). Cambia orden si quieres priorizar EMQX:
+    const BROKERS = [
+      { name:"mosquitto", url:"wss://test.mosquitto.org:8081/mqtt" },
+      { name:"emqx",      url:"wss://broker.emqx.io:8084/mqtt" }
+    ];
+
+    // Permite elegir broker con #mosquitto o #emqx en la URL
+    const hash = (location.hash || "").replace("#","").toLowerCase().trim();
+    let brokerIndex = Math.max(0, BROKERS.findIndex(b=>b.name===hash));
+    if (hash && brokerIndex === -1) brokerIndex = 0; // si hash no coincide, arranca normal
+
+    // =============== STATE/UI ===============
     let model, client, webcamEl;
     let lastLoop = 0, lastPublished = 0;
     let lastOverThreshold = false;
     let threshold = 0.80;
-
-    // ===================== UI HELPERS =================
     const $ = (id)=>document.getElementById(id);
     const log = (t)=>{ const L = $("log"); const line = document.createElement("div"); line.textContent = t; L.prepend(line); }
     const setPill = (id, ok, text)=>{ const el=$(id); el.classList.remove("ok","bad"); el.classList.add(ok?"ok":"bad"); el.textContent = text; }
@@ -93,9 +104,14 @@
       $("thVal").textContent = threshold.toFixed(2);
     });
 
-    // ===================== INIT =======================
+    function currentBroker(){ return BROKERS[brokerIndex]; }
+    function showBroker(){ $("brokerLabel").textContent = `${currentBroker().name} → ${currentBroker().url}`; }
+
+    // =============== INIT ===============
     async function init() {
       try {
+        showBroker();
+
         // 1) Modelo
         setPill("model-pill", false, "Modelo: cargando…");
         model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
@@ -104,8 +120,7 @@
         // 2) Cámara
         webcamEl = $("webcam");
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: { ideal: "environment" } },
-          audio: false
+          video: { facingMode: { ideal: "environment" } }, audio: false
         });
         webcamEl.srcObject = stream;
         await webcamEl.play();
@@ -113,38 +128,62 @@
         $("status").textContent = "Cámara y modelo listos.";
 
         // 3) MQTT
-        setPill("mqtt-pill", false, "MQTT: conectando…");
-        client = mqtt.connect(MQTT_WSS_URL, {
-          clientId: "tm_phone_" + Math.random().toString(16).slice(2),
-          clean: true,
-          connectTimeout: 5000,
-          keepalive: 30,
-          reconnectPeriod: 2000
-        });
-
-        client.on("connect", ()=>{
-          setPill("mqtt-pill", true, "MQTT: conectado");
-          log("MQTT conectado → " + MQTT_WSS_URL);
-          requestAnimationFrame(loop);
-        });
-        client.on("reconnect", ()=>{
-          setPill("mqtt-pill", false, "MQTT: reconectando…");
-        });
-        client.on("close", ()=>{
-          setPill("mqtt-pill", false, "MQTT: desconectado");
-        });
-        client.on("error", (e)=>{
-          setPill("mqtt-pill", false, "MQTT: error");
-          log("MQTT error: " + (e?.message || e));
-        });
+        connectMqtt();
       } catch (err) {
         $("status").textContent = "Error: " + err.message;
-        setPill("cam-pill", false, "Cámara: error");
-        log("Init error: " + err.stack);
+        setPill("cam-pill", false, "Cámara/Modelo: error");
+        $("err").textContent = err.stack || err.message || String(err);
+        log("Init error: " + (err.stack || err.message || err));
       }
     }
 
-    // ===================== LOOP =======================
+    function connectMqtt() {
+      const broker = currentBroker();
+      setPill("mqtt-pill", false, "MQTT: conectando…");
+      $("err").textContent = "";
+      log(`Conectando a ${broker.name}… (${broker.url})`);
+
+      client = mqtt.connect(broker.url, {
+        clientId: "tm_phone_" + Math.random().toString(16).slice(2),
+        clean: true,
+        connectTimeout: 6000,
+        keepalive: 30,
+        reconnectPeriod: 0, // manejamos reintento manual para cambiar de broker
+      });
+
+      client.on("connect", ()=>{
+        setPill("mqtt-pill", true, "MQTT: conectado");
+        log("MQTT conectado → " + broker.url);
+        requestAnimationFrame(loop);
+      });
+
+      client.on("close", ()=>{
+        setPill("mqtt-pill", false, "MQTT: desconectado");
+        log("MQTT cerrado");
+      });
+
+      client.on("error", (e)=>{
+        setPill("mqtt-pill", false, "MQTT: error");
+        const msg = (e && (e.message || e.toString())) || "error desconocido";
+        $("err").textContent = `Error MQTT (${broker.name}): ${msg}`;
+        log(`MQTT error (${broker.name}): ${msg}`);
+
+        // Intentar siguiente broker tras un pequeño delay
+        setTimeout(()=>{
+          tryNextBroker();
+        }, 800);
+      });
+    }
+
+    function tryNextBroker(){
+      // Cierra si quedó colgado
+      try { client && client.end(true); } catch(e){}
+      brokerIndex = (brokerIndex + 1) % BROKERS.length;
+      showBroker();
+      connectMqtt();
+    }
+
+    // =============== LOOP ===============
     async function loop(ts) {
       try {
         if (!lastLoop || (ts - lastLoop) >= LOOP_LIMIT_MS) {
@@ -152,15 +191,13 @@
 
           // Predicción
           const preds = await model.predict(webcamEl);
-          // Normaliza y busca la clase objetivo
           const target = preds.find(p => (p.className || "").toLowerCase().trim() === TARGET_LABEL);
           const prob = target ? Number(target.probability) : 0;
           $("pred").textContent = `carrito: ${(prob*100).toFixed(1)}%`;
 
-          // Lógica: publicar solo cuando se cruza el umbral (rising edge)
+          // Publicar solo cuando cruza el umbral (rising edge)
           const over = prob >= threshold;
           const now = performance.now();
-
           if (client && client.connected && over && !lastOverThreshold && (now - lastPublished) > PUBLISH_COOLDOWN_MS) {
             const payload = JSON.stringify({ label: TARGET_LABEL, score: Number(prob.toFixed(3)), ts: Date.now() });
             client.publish(MQTT_TOPIC, payload, { qos: 0, retain: false });
@@ -170,12 +207,11 @@
           lastOverThreshold = over;
         }
       } catch (err) {
-        log("Loop error: " + err.message);
+        log("Loop error: " + (err.message || err));
       }
       requestAnimationFrame(loop);
     }
 
-    // ===================== START =====================
     init();
   </script>
 </body>
