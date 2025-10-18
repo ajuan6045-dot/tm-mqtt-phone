@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TM → MQTT (carrito)</title>
+</head>
+<body>
+  <h2>Teachable Machine → MQTT</h2>
+  <video id="webcam" autoplay playsinline width="320" height="240"></video>
+  <div id="status">Cargando modelo...</div>
+  <div id="pred"></div>
+
+  <!-- TensorFlow.js y Teachable Machine -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+
+  <!-- MQTT.js (cliente MQTT en navegador) -->
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
+
+  <script>
+    // === CONFIGURACIÓN ===
+    const MODEL_URL = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/"; // tu modelo TM
+    const MQTT_WSS_URL = "wss://test.mosquitto.org:8081/mqtt"; // broker Mosquitto (WSS = seguro)
+    const MQTT_TOPIC = "umng/tm/esp32/84aQnaddKh"; // debe coincidir con el del ESP32
+    const TARGET_LABEL = "carrito";  // nombre exacto de la clase
+    const PUBLISH_MS = 300;          // tiempo mínimo entre envíos (ms)
+
+    let model, client, lastSend = 0;
+
+    async function init() {
+      // Cargar modelo de Teachable Machine
+      const modelURL = MODEL_URL + "model.json";
+      const metadataURL = MODEL_URL + "metadata.json";
+      model = await tmImage.load(modelURL, metadataURL);
+
+      // Activar cámara (trasera si hay)
+      const webcam = document.getElementById("webcam");
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" }, audio: false
+      });
+      webcam.srcObject = stream;
+      await webcam.play();
+
+      document.getElementById("status").innerText = "Cámara y modelo listos.";
+
+      // Conectar al broker MQTT (Mosquitto público)
+      client = mqtt.connect(MQTT_WSS_URL, {
+        clientId: "tm_phone_" + Math.random().toString(16).slice(2),
+        clean: true, connectTimeout: 4000
+      });
+
+      client.on("connect", () => {
+        document.getElementById("status").innerText = "Conectado a MQTT.";
+        loop();
+      });
+
+      client.on("error", err => {
+        document.getElementById("status").innerText = "Error MQTT: " + err.message;
+      });
+    }
+
+    async function loop() {
+      const webcam = document.getElementById("webcam");
+      const prediction = await model.predict(webcam);
+
+      // buscar la clase "carrito"
+      const target = prediction.find(p => p.className.toLowerCase() === TARGET_LABEL);
+      const prob = target ? target.probability : 0;
+      document.getElementById("pred").innerText =
+        `${TARGET_LABEL}: ${(prob*100).toFixed(1)}%`;
+
+      // Enviar por MQTT si ha pasado tiempo suficiente
+      const now = performance.now();
+      if (client.connected && now - lastSend > PUBLISH_MS) {
+        const msg = JSON.stringify({
+          label: TARGET_LABEL,
+          score: prob.toFixed(3),
+          ts: Date.now()
+        });
+        client.publish(MQTT_TOPIC, msg);
+        lastSend = now;
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    init();
+  </script>
+</body>
+</html>
