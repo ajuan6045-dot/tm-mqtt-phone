@@ -3,88 +3,179 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>TM → MQTT (carrito)</title>
+  <title>Teachable Machine → ESP32 via MQTT (carrito)</title>
+  <style>
+    :root { --ok:#2ecc71; --bad:#e74c3c; --fg:#222; --muted:#666; }
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:#f7f7f8; color:var(--fg); margin:0; }
+    .wrap { max-width: 720px; margin: 24px auto; padding: 0 16px; }
+    h1 { font-size: 1.3rem; margin: 0 0 8px; }
+    .card { background:#fff; border-radius:12px; box-shadow: 0 6px 18px rgba(0,0,0,.06); padding:16px; margin: 12px 0; }
+    .row { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+    .pill { padding:6px 10px; border-radius:999px; font-size:.9rem; }
+    .ok { background: #eafaf0; color: #1e874b; }
+    .bad { background: #fdecea; color: #a33a2a; }
+    .muted { color: var(--muted); }
+    video { width:100%; max-width: 420px; border-radius: 12px; box-shadow: 0 0 8px rgba(0,0,0,.15); background:#000; }
+    label { font-weight:600; }
+    input[type="range"] { width: 220px; }
+    code { background:#f0f0f0; padding:2px 6px; border-radius:6px; }
+    .small { font-size:.9rem; }
+  </style>
 </head>
 <body>
-  <h2>Teachable Machine → MQTT</h2>
-  <video id="webcam" autoplay playsinline width="320" height="240"></video>
-  <div id="status">Cargando modelo...</div>
-  <div id="pred"></div>
+  <div class="wrap">
+    <h1>🧠 Teachable Machine → MQTT → 🤖 ESP32 (clase: <code>carrito</code>)</h1>
 
-  <!-- TensorFlow.js y Teachable Machine -->
+    <div class="card">
+      <div class="row">
+        <div id="mqtt-pill" class="pill bad">MQTT: desconectado</div>
+        <div id="cam-pill" class="pill bad">Cámara: sin permiso</div>
+        <div class="pill ok" id="model-pill">Modelo: cargando…</div>
+      </div>
+      <div class="small muted" id="status">Iniciando…</div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between;">
+        <div>
+          <div><label>Umbral (confianza): </label>
+            <span id="thVal">0.80</span>
+          </div>
+          <input id="thSlider" type="range" min="0.50" max="0.98" step="0.01" value="0.80" />
+        </div>
+        <div>
+          <label>Tópico MQTT:</label>
+          <div class="small"><code id="topicLabel">umng/tm/esp32/84aQnaddKh</code></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="text-align:center;">
+      <video id="webcam" autoplay playsinline muted></video>
+      <div id="pred" style="margin-top:8px;font-size:1.1rem;">carrito: —</div>
+    </div>
+
+    <div class="card small">
+      <b>Registro:</b>
+      <div id="log" style="max-height:160px; overflow:auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;"></div>
+    </div>
+  </div>
+
+  <!-- TF.js + Teachable Machine -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.18.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
-
-  <!-- MQTT.js (cliente MQTT en navegador) -->
+  <!-- MQTT over WebSockets -->
   <script src="https://unpkg.com/mqtt/dist/mqtt.min.js"></script>
 
   <script>
-    // === CONFIGURACIÓN ===
-    const MODEL_URL = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/"; // tu modelo TM
-    const MQTT_WSS_URL = "wss://test.mosquitto.org:8081/mqtt"; // broker Mosquitto (WSS = seguro)
-    const MQTT_TOPIC = "umng/tm/esp32/84aQnaddKh"; // debe coincidir con el del ESP32
-    const TARGET_LABEL = "carrito";  // nombre exacto de la clase
-    const PUBLISH_MS = 300;          // tiempo mínimo entre envíos (ms)
+    // ===================== CONFIG =====================
+    const MODEL_URL    = "https://teachablemachine.withgoogle.com/models/84aQnaddKh/"; // tu modelo TM
+    const MQTT_WSS_URL = "wss://test.mosquitto.org:8081/mqtt"; // broker Mosquitto público (WSS para navegador)
+    const MQTT_TOPIC   = "umng/tm/esp32/84aQnaddKh";           // usa el mismo en tu ESP32
+    const TARGET_LABEL = "carrito";                            // clase objetivo en minúsculas
+    const LOOP_LIMIT_MS = 240;      // cadencia de predicción (~4 fps para móviles modestos)
+    const PUBLISH_COOLDOWN_MS = 600; // mínimo entre publicaciones válidas (evita spam)
 
-    let model, client, lastSend = 0;
+    // ===================== STATE ======================
+    let model, client, webcamEl;
+    let lastLoop = 0, lastPublished = 0;
+    let lastOverThreshold = false;
+    let threshold = 0.80;
 
+    // ===================== UI HELPERS =================
+    const $ = (id)=>document.getElementById(id);
+    const log = (t)=>{ const L = $("log"); const line = document.createElement("div"); line.textContent = t; L.prepend(line); }
+    const setPill = (id, ok, text)=>{ const el=$(id); el.classList.remove("ok","bad"); el.classList.add(ok?"ok":"bad"); el.textContent = text; }
+
+    $("topicLabel").textContent = MQTT_TOPIC;
+    $("thSlider").addEventListener("input", e=>{
+      threshold = Number(e.target.value);
+      $("thVal").textContent = threshold.toFixed(2);
+    });
+
+    // ===================== INIT =======================
     async function init() {
-      // Cargar modelo de Teachable Machine
-      const modelURL = MODEL_URL + "model.json";
-      const metadataURL = MODEL_URL + "metadata.json";
-      model = await tmImage.load(modelURL, metadataURL);
+      try {
+        // 1) Modelo
+        setPill("model-pill", false, "Modelo: cargando…");
+        model = await tmImage.load(MODEL_URL + "model.json", MODEL_URL + "metadata.json");
+        setPill("model-pill", true, "Modelo: listo");
 
-      // Activar cámara (trasera si hay)
-      const webcam = document.getElementById("webcam");
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" }, audio: false
-      });
-      webcam.srcObject = stream;
-      await webcam.play();
+        // 2) Cámara
+        webcamEl = $("webcam");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: { ideal: "environment" } },
+          audio: false
+        });
+        webcamEl.srcObject = stream;
+        await webcamEl.play();
+        setPill("cam-pill", true, "Cámara: OK");
+        $("status").textContent = "Cámara y modelo listos.";
 
-      document.getElementById("status").innerText = "Cámara y modelo listos.";
+        // 3) MQTT
+        setPill("mqtt-pill", false, "MQTT: conectando…");
+        client = mqtt.connect(MQTT_WSS_URL, {
+          clientId: "tm_phone_" + Math.random().toString(16).slice(2),
+          clean: true,
+          connectTimeout: 5000,
+          keepalive: 30,
+          reconnectPeriod: 2000
+        });
 
-      // Conectar al broker MQTT (Mosquitto público)
-      client = mqtt.connect(MQTT_WSS_URL, {
-        clientId: "tm_phone_" + Math.random().toString(16).slice(2),
-        clean: true, connectTimeout: 4000
-      });
-
-      client.on("connect", () => {
-        document.getElementById("status").innerText = "Conectado a MQTT.";
-        loop();
-      });
-
-      client.on("error", err => {
-        document.getElementById("status").innerText = "Error MQTT: " + err.message;
-      });
+        client.on("connect", ()=>{
+          setPill("mqtt-pill", true, "MQTT: conectado");
+          log("MQTT conectado → " + MQTT_WSS_URL);
+          requestAnimationFrame(loop);
+        });
+        client.on("reconnect", ()=>{
+          setPill("mqtt-pill", false, "MQTT: reconectando…");
+        });
+        client.on("close", ()=>{
+          setPill("mqtt-pill", false, "MQTT: desconectado");
+        });
+        client.on("error", (e)=>{
+          setPill("mqtt-pill", false, "MQTT: error");
+          log("MQTT error: " + (e?.message || e));
+        });
+      } catch (err) {
+        $("status").textContent = "Error: " + err.message;
+        setPill("cam-pill", false, "Cámara: error");
+        log("Init error: " + err.stack);
+      }
     }
 
-    async function loop() {
-      const webcam = document.getElementById("webcam");
-      const prediction = await model.predict(webcam);
+    // ===================== LOOP =======================
+    async function loop(ts) {
+      try {
+        if (!lastLoop || (ts - lastLoop) >= LOOP_LIMIT_MS) {
+          lastLoop = ts;
 
-      // buscar la clase "carrito"
-      const target = prediction.find(p => p.className.toLowerCase() === TARGET_LABEL);
-      const prob = target ? target.probability : 0;
-      document.getElementById("pred").innerText =
-        `${TARGET_LABEL}: ${(prob*100).toFixed(1)}%`;
+          // Predicción
+          const preds = await model.predict(webcamEl);
+          // Normaliza y busca la clase objetivo
+          const target = preds.find(p => (p.className || "").toLowerCase().trim() === TARGET_LABEL);
+          const prob = target ? Number(target.probability) : 0;
+          $("pred").textContent = `carrito: ${(prob*100).toFixed(1)}%`;
 
-      // Enviar por MQTT si ha pasado tiempo suficiente
-      const now = performance.now();
-      if (client.connected && now - lastSend > PUBLISH_MS) {
-        const msg = JSON.stringify({
-          label: TARGET_LABEL,
-          score: prob.toFixed(3),
-          ts: Date.now()
-        });
-        client.publish(MQTT_TOPIC, msg);
-        lastSend = now;
+          // Lógica: publicar solo cuando se cruza el umbral (rising edge)
+          const over = prob >= threshold;
+          const now = performance.now();
+
+          if (client && client.connected && over && !lastOverThreshold && (now - lastPublished) > PUBLISH_COOLDOWN_MS) {
+            const payload = JSON.stringify({ label: TARGET_LABEL, score: Number(prob.toFixed(3)), ts: Date.now() });
+            client.publish(MQTT_TOPIC, payload, { qos: 0, retain: false });
+            lastPublished = now;
+            log("Publicado: " + payload);
+          }
+          lastOverThreshold = over;
+        }
+      } catch (err) {
+        log("Loop error: " + err.message);
       }
-
       requestAnimationFrame(loop);
     }
 
+    // ===================== START =====================
     init();
   </script>
 </body>
